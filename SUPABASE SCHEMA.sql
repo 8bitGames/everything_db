@@ -83,7 +83,7 @@ CREATE TYPE report_reason AS ENUM ('spam', 'inappropriate_content', 'harassment'
 CREATE TYPE admin_action_type AS ENUM ('user_suspended', 'shop_approved', 'shop_rejected', 'refund_processed', 'points_adjusted');
 
 -- =============================================
--- 핵심 테이블들 (CORE TABLES)
+-- 핵심 테이블들 (CORE TABLE
 -- =============================================
 
 -- 사용자 테이블 (Supabase auth.users 확장)
@@ -411,6 +411,455 @@ CREATE TABLE public.admin_actions (
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
+-- =============================================
+-- 시스템 설정 & 공용 정책 테이블들 (SYSTEM SETTINGS & POLICIES)
+-- =============================================
+
+-- 시스템 전역 설정 테이블
+-- 어드민에서 코드 수정 없이 전역 설정값들을 관리
+-- key-value 방식으로 다양한 타입의 설정값 저장 가능
+CREATE TABLE public.system_settings (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    setting_key VARCHAR(100) UNIQUE NOT NULL, -- 설정 키 (예: 'default_commission_rate')
+    setting_value TEXT NOT NULL, -- 설정값 (문자열로 저장 후 타입 변환)
+    value_type VARCHAR(20) DEFAULT 'string', -- 값 타입 ('string', 'number', 'boolean', 'json')
+    category VARCHAR(50) NOT NULL, -- 설정 카테고리 ('payment', 'point', 'notification' 등)
+    description TEXT, -- 설정 설명
+    is_active BOOLEAN DEFAULT TRUE, -- 설정 활성화 여부
+    created_by UUID REFERENCES public.users(id), -- 설정 생성 관리자
+    updated_by UUID REFERENCES public.users(id), -- 설정 수정 관리자
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- 간소화: business_policies 제거 (필요한 정책은 system_settings에서 관리)
+
+-- 서비스 카테고리 기본 설정 테이블
+-- 카테고리별 기본 예약 정책, 수수료율 등을 중앙 관리
+CREATE TABLE public.service_category_configs (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    category service_category PRIMARY KEY, -- 서비스 카테고리
+    default_commission_rate DECIMAL(5,2) DEFAULT 10.00, -- 카테고리별 기본 수수료율
+    default_deposit_percentage DECIMAL(5,2) DEFAULT 30.00, -- 기본 예약금 비율
+    default_cancellation_hours INTEGER DEFAULT 24, -- 기본 취소 가능 시간
+    default_booking_advance_days INTEGER DEFAULT 30, -- 기본 사전 예약 가능 일수
+    min_service_duration INTEGER DEFAULT 30, -- 최소 서비스 시간(분)
+    max_service_duration INTEGER DEFAULT 300, -- 최대 서비스 시간(분)
+    category_description TEXT, -- 카테고리 설명
+    is_active BOOLEAN DEFAULT TRUE, -- 카테고리 활성화 여부
+    display_order INTEGER DEFAULT 0, -- 앱에서 표시 순서
+    icon_url TEXT, -- 카테고리 아이콘 URL
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- 간소화: 복잡한 알림 템플릿 제거 (필요시 코드에서 직접 관리)
+
+-- 앱 버전 및 운영 설정 테이블
+-- 앱 업데이트, 점검 모드, 공지사항 등 운영 관련 설정 관리
+CREATE TABLE public.app_configs (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    config_key VARCHAR(100) UNIQUE NOT NULL, -- 설정 키
+    platform VARCHAR(20) NOT NULL, -- 플랫폼 ('ios', 'android', 'all')
+    config_data JSONB NOT NULL, -- 설정 데이터
+    is_active BOOLEAN DEFAULT TRUE,
+    created_by UUID REFERENCES public.users(id),
+    updated_by UUID REFERENCES public.users(id),
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- 프로모션 및 이벤트 테이블
+-- 할인 쿠폰, 포인트 보너스, 이벤트 등을 어드민에서 관리
+CREATE TABLE public.promotions (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    promotion_code VARCHAR(50) UNIQUE, -- 프로모션 코드 (쿠폰 등)
+    title VARCHAR(255) NOT NULL, -- 프로모션 제목
+    description TEXT, -- 프로모션 설명
+    promotion_type VARCHAR(50) NOT NULL, -- 유형 ('discount', 'point_bonus', 'free_service' 등)
+    target_audience JSONB, -- 대상 사용자 (신규, 기존, 인플루언서 등)
+    conditions JSONB, -- 적용 조건 (최소 금액, 특정 카테고리 등)
+    benefits JSONB, -- 혜택 내용 (할인율, 포인트 배율 등)
+    usage_limit INTEGER, -- 총 사용 제한
+    usage_limit_per_user INTEGER DEFAULT 1, -- 사용자당 사용 제한
+    current_usage INTEGER DEFAULT 0, -- 현재 사용 횟수
+    starts_at TIMESTAMPTZ NOT NULL, -- 프로모션 시작일
+    ends_at TIMESTAMPTZ NOT NULL, -- 프로모션 종료일
+    is_active BOOLEAN DEFAULT TRUE,
+    created_by UUID REFERENCES public.users(id),
+    updated_by UUID REFERENCES public.users(id),
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- =============================================
+-- 정산 시스템 (SETTLEMENT SYSTEM)
+-- =============================================
+
+-- 정산 주기 및 상태 ENUM
+CREATE TYPE settlement_status AS ENUM ('pending', 'processing', 'completed', 'failed', 'cancelled');
+CREATE TYPE settlement_period AS ENUM ('weekly', 'bi_weekly', 'monthly');
+
+-- 샵별 정산 설정 테이블
+-- 각 샵의 정산 주기, 계좌 정보, 세무 정보 관리
+CREATE TABLE public.shop_settlement_configs (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    shop_id UUID NOT NULL REFERENCES public.shops(id) ON DELETE CASCADE,
+    settlement_period settlement_period DEFAULT 'weekly', -- 정산 주기
+    settlement_day INTEGER DEFAULT 1, -- 정산 요일 (1=월요일, 7=일요일) 또는 날짜
+    bank_name VARCHAR(100), -- 은행명
+    bank_account VARCHAR(50), -- 계좌번호 (암호화 저장 권장)
+    account_holder VARCHAR(100), -- 예금주
+    business_registration_number VARCHAR(20), -- 사업자등록번호
+    tax_invoice_email VARCHAR(255), -- 세금계산서 발행 이메일
+    commission_rate DECIMAL(5,2), -- 개별 수수료율 (없으면 기본값 적용)
+    minimum_settlement_amount INTEGER DEFAULT 10000, -- 최소 정산 금액
+    auto_settlement BOOLEAN DEFAULT TRUE, -- 자동 정산 여부
+    is_active BOOLEAN DEFAULT TRUE,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(shop_id)
+);
+
+-- 정산 배치 테이블 (정산 회차별 정보)
+-- 주간/월간 정산을 위한 배치 단위 관리
+CREATE TABLE public.settlement_batches (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    batch_name VARCHAR(100) NOT NULL, -- 정산 배치명 (예: "2024년 1월 1주차")
+    settlement_period settlement_period NOT NULL, -- 정산 주기
+    period_start_date DATE NOT NULL, -- 정산 기간 시작일
+    period_end_date DATE NOT NULL, -- 정산 기간 종료일
+    total_revenue INTEGER DEFAULT 0, -- 총 매출액
+    total_commission INTEGER DEFAULT 0, -- 총 수수료
+    total_settlement_amount INTEGER DEFAULT 0, -- 총 정산 금액
+    shop_count INTEGER DEFAULT 0, -- 정산 대상 샵 수
+    status settlement_status DEFAULT 'pending', -- 배치 상태
+    processed_at TIMESTAMPTZ, -- 처리 완료 시간
+    created_by UUID REFERENCES public.users(id), -- 처리 관리자
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- 샵별 정산 내역 테이블
+-- 각 정산 배치에서 샵별 상세 정산 정보
+CREATE TABLE public.shop_settlements (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    settlement_batch_id UUID NOT NULL REFERENCES public.settlement_batches(id) ON DELETE CASCADE,
+    shop_id UUID NOT NULL REFERENCES public.shops(id) ON DELETE CASCADE,
+    period_start_date DATE NOT NULL, -- 정산 기간 시작일
+    period_end_date DATE NOT NULL, -- 정산 기간 종료일
+    total_bookings INTEGER DEFAULT 0, -- 총 예약 건수
+    completed_bookings INTEGER DEFAULT 0, -- 완료된 예약 건수
+    cancelled_bookings INTEGER DEFAULT 0, -- 취소된 예약 건수
+    gross_revenue INTEGER DEFAULT 0, -- 총 매출액 (예약금 + 잔금)
+    commission_rate DECIMAL(5,2) NOT NULL, -- 적용된 수수료율
+    commission_amount INTEGER DEFAULT 0, -- 수수료 금액
+    adjustment_amount INTEGER DEFAULT 0, -- 조정 금액 (환불, 패널티 등)
+    net_settlement_amount INTEGER DEFAULT 0, -- 최종 정산 금액 (매출 - 수수료 - 조정)
+    tax_amount INTEGER DEFAULT 0, -- 세금 (부가세 등)
+    settlement_status settlement_status DEFAULT 'pending', -- 정산 상태
+    bank_transfer_amount INTEGER DEFAULT 0, -- 실제 송금 금액
+    transfer_fee INTEGER DEFAULT 0, -- 송금 수수료
+    settled_at TIMESTAMPTZ, -- 정산 완료 시간
+    settlement_notes TEXT, -- 정산 메모
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(settlement_batch_id, shop_id)
+);
+
+-- 정산 상세 내역 테이블 (예약별)
+-- 정산에 포함된 개별 예약들의 상세 정보
+CREATE TABLE public.settlement_details (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    settlement_id UUID NOT NULL REFERENCES public.shop_settlements(id) ON DELETE CASCADE,
+    reservation_id UUID NOT NULL REFERENCES public.reservations(id) ON DELETE CASCADE,
+    service_amount INTEGER NOT NULL, -- 서비스 금액
+    commission_rate DECIMAL(5,2) NOT NULL, -- 수수료율
+    commission_amount INTEGER NOT NULL, -- 수수료 금액
+    net_amount INTEGER NOT NULL, -- 순수익 (서비스 금액 - 수수료)
+    payment_method payment_method NOT NULL, -- 결제 수단
+    completed_at TIMESTAMPTZ NOT NULL, -- 서비스 완료 시간
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- =============================================
+-- 정산 관련 통계 (SETTLEMENT STATISTICS - 정산만)
+-- =============================================
+
+-- 정산 스케줄 관리 테이블
+-- 관리자가 정산 일정을 미리 설정하고 관리
+CREATE TABLE public.settlement_schedules (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    schedule_name VARCHAR(100) NOT NULL, -- 스케줄명 (예: "주간 정산")
+    settlement_period settlement_period NOT NULL, -- 정산 주기
+    schedule_day INTEGER NOT NULL, -- 정산 실행 요일 (1=월요일) 또는 날짜
+    schedule_time TIME DEFAULT '15:00', -- 정산 실행 시간
+    target_shop_type shop_type, -- NULL이면 전체, 있으면 특정 타입만
+    is_active BOOLEAN DEFAULT TRUE, -- 스케줄 활성화 여부
+    auto_approve BOOLEAN DEFAULT FALSE, -- 자동 승인 여부 (FALSE면 수동 승인)
+    notification_emails TEXT[], -- 정산 완료 시 알림받을 이메일들
+    created_by UUID REFERENCES public.users(id),
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- 정산 승인 및 송금 처리 테이블
+-- 관리자의 정산 승인부터 실제 송금까지의 전체 프로세스 관리
+CREATE TABLE public.settlement_transfers (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    settlement_id UUID NOT NULL REFERENCES public.shop_settlements(id) ON DELETE CASCADE,
+    transfer_status VARCHAR(50) DEFAULT 'pending_approval', -- 송금 상태
+    -- 'pending_approval' → 'approved' → 'transfer_requested' → 'transfer_completed' → 'failed'
+    approved_by UUID REFERENCES public.users(id), -- 승인한 관리자
+    approved_at TIMESTAMPTZ, -- 승인 시간
+    transfer_method VARCHAR(50), -- 송금 방법 ('bank_transfer', 'toss_transfer' 등)
+    bank_name VARCHAR(100), -- 송금할 은행
+    account_number VARCHAR(50), -- 계좌번호 (암호화 권장)
+    account_holder VARCHAR(100), -- 예금주
+    transfer_amount INTEGER NOT NULL, -- 실제 송금 금액
+    transfer_fee INTEGER DEFAULT 0, -- 송금 수수료
+    external_transfer_id VARCHAR(255), -- 외부 송금 서비스 거래 ID
+    transfer_requested_at TIMESTAMPTZ, -- 송금 요청 시간
+    transfer_completed_at TIMESTAMPTZ, -- 송금 완료 시간
+    failure_reason TEXT, -- 송금 실패 사유
+    admin_notes TEXT, -- 관리자 메모
+    retry_count INTEGER DEFAULT 0, -- 재시도 횟수
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(settlement_id)
+);
+
+-- 간소화된 정산 로그 테이블 (핵심 정보만)
+CREATE TABLE public.settlement_logs (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    settlement_id UUID NOT NULL REFERENCES public.shop_settlements(id) ON DELETE CASCADE,
+    action VARCHAR(50) NOT NULL, -- 액션 ('approved', 'transfer_completed', 'failed')
+    performed_by UUID REFERENCES public.users(id), -- 작업 수행자
+    notes TEXT, -- 작업 메모
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- =============================================
+-- 정산 및 통계 관련 인덱스들 (INDEXES FOR SETTLEMENT & ANALYTICS)
+-- =============================================
+
+-- 정산 관련 인덱스
+CREATE INDEX idx_shop_settlements_batch_shop ON public.shop_settlements(settlement_batch_id, shop_id);
+CREATE INDEX idx_shop_settlements_status ON public.shop_settlements(settlement_status);
+CREATE INDEX idx_shop_settlements_period ON public.shop_settlements(period_start_date, period_end_date);
+CREATE INDEX idx_settlement_details_reservation ON public.settlement_details(reservation_id);
+
+-- =============================================
+-- 정산 관련 트리거들 (TRIGGERS FOR SETTLEMENT ONLY)
+-- =============================================
+
+-- 정산 관련 테이블들에 updated_at 트리거 추가
+CREATE TRIGGER update_shop_settlement_configs_updated_at BEFORE UPDATE ON public.shop_settlement_configs
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+CREATE TRIGGER update_settlement_batches_updated_at BEFORE UPDATE ON public.settlement_batches
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+CREATE TRIGGER update_shop_settlements_updated_at BEFORE UPDATE ON public.shop_settlements
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+CREATE TRIGGER update_settlement_schedules_updated_at BEFORE UPDATE ON public.settlement_schedules
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+CREATE TRIGGER update_settlement_transfers_updated_at BEFORE UPDATE ON public.settlement_transfers
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+-- =============================================
+-- 정산 관련 비즈니스 로직 함수들 (SETTLEMENT BUSINESS LOGIC)
+-- =============================================
+
+-- 샵별 정산 금액 계산 함수
+-- 특정 기간 동안의 완료된 예약들을 기준으로 정산액 계산
+CREATE OR REPLACE FUNCTION calculate_shop_settlement(
+    shop_uuid UUID,
+    start_date DATE,
+    end_date DATE
+)
+RETURNS TABLE(
+    gross_revenue INTEGER,
+    commission_amount INTEGER,
+    net_settlement INTEGER,
+    booking_count INTEGER
+) AS $$
+DECLARE
+    commission_rate_val DECIMAL(5,2);
+BEGIN
+    -- 샵의 수수료율 조회 (개별 설정 또는 기본값)
+    SELECT COALESCE(ssc.commission_rate, calculate_commission_rate(shop_uuid))
+    INTO commission_rate_val
+    FROM public.shop_settlement_configs ssc
+    WHERE ssc.shop_id = shop_uuid;
+    
+    -- 기간 내 완료된 예약들의 정산 정보 계산
+    RETURN QUERY
+    SELECT 
+        SUM(r.total_amount)::INTEGER as gross_revenue,
+        FLOOR(SUM(r.total_amount * commission_rate_val / 100))::INTEGER as commission_amount,
+        (SUM(r.total_amount) - FLOOR(SUM(r.total_amount * commission_rate_val / 100)))::INTEGER as net_settlement,
+        COUNT(*)::INTEGER as booking_count
+    FROM public.reservations r
+    WHERE r.shop_id = shop_uuid
+    AND r.status = 'completed'
+    AND r.completed_at::DATE BETWEEN start_date AND end_date;
+END;
+$$ LANGUAGE plpgsql;
+
+-- 정산 배치 생성 함수
+-- 주간/월간 정산을 위한 배치를 생성하고 각 샵별 정산 내역 계산
+CREATE OR REPLACE FUNCTION create_settlement_batch(
+    period_type settlement_period,
+    start_date DATE,
+    end_date DATE
+)
+RETURNS UUID AS $$
+DECLARE
+    batch_id UUID;
+    shop_record RECORD;
+    settlement_data RECORD;
+    batch_name TEXT;
+BEGIN
+    -- 배치명 생성
+    batch_name := CASE period_type
+        WHEN 'weekly' THEN start_date::TEXT || ' ~ ' || end_date::TEXT || ' 주간정산'
+        WHEN 'monthly' THEN TO_CHAR(start_date, 'YYYY년 MM월') || ' 월간정산'
+        ELSE start_date::TEXT || ' ~ ' || end_date::TEXT || ' 정산'
+    END;
+    
+    -- 정산 배치 생성
+    INSERT INTO public.settlement_batches (
+        batch_name, settlement_period, period_start_date, period_end_date, status
+    ) VALUES (
+        batch_name, period_type, start_date, end_date, 'processing'
+    ) RETURNING id INTO batch_id;
+    
+    -- 각 활성 샵에 대해 정산 내역 생성
+    FOR shop_record IN 
+        SELECT id, name FROM public.shops 
+        WHERE shop_status = 'active' 
+    LOOP
+        -- 샵별 정산 금액 계산
+        SELECT * INTO settlement_data 
+        FROM calculate_shop_settlement(shop_record.id, start_date, end_date);
+        
+        -- 정산 데이터가 있는 경우에만 정산 내역 생성
+        IF settlement_data.booking_count > 0 THEN
+            INSERT INTO public.shop_settlements (
+                settlement_batch_id,
+                shop_id,
+                period_start_date,
+                period_end_date,
+                completed_bookings,
+                gross_revenue,
+                -- 여기서 실제 적용된 수수료율을 다시 계산해야 함
+                calculate_commission_rate(shop_record.id),
+                settlement_data.commission_amount,
+                settlement_data.net_settlement
+            ) VALUES (
+                batch_id,
+                shop_record.id,
+                start_date,
+                end_date,
+                settlement_data.booking_count,
+                settlement_data.gross_revenue,
+                -- 여기서 실제 적용된 수수료율을 다시 계산해야 함
+                calculate_commission_rate(shop_record.id),
+                settlement_data.commission_amount,
+                settlement_data.net_settlement
+            );
+        END IF;
+    END LOOP;
+    
+    -- 배치 상태를 pending으로 변경
+    UPDATE public.settlement_batches 
+    SET status = 'pending', updated_at = NOW()
+    WHERE id = batch_id;
+    
+    RETURN batch_id;
+END;
+$$ LANGUAGE plpgsql;
+
+
+
+-- =============================================
+-- 공용 설정 관리 함수들 (UTILITY FUNCTIONS FOR SETTINGS)
+-- =============================================
+
+-- 간소화된 수수료율 계산 함수
+CREATE OR REPLACE FUNCTION calculate_commission_rate(shop_uuid UUID)
+RETURNS DECIMAL AS $$
+DECLARE
+    shop_type_val shop_type;
+    commission_rate DECIMAL;
+BEGIN
+    -- 샵 타입 조회
+    SELECT shop_type INTO shop_type_val FROM public.shops WHERE id = shop_uuid;
+    
+    -- 샵 타입에 따른 수수료율 적용
+    IF shop_type_val = 'partnered' THEN
+        commission_rate := get_system_setting_number('partnered_commission_rate');
+    ELSE
+        commission_rate := get_system_setting_number('non_partnered_commission_rate');
+    END IF;
+    
+    RETURN COALESCE(commission_rate, 10.00); -- 기본값 10%
+END;
+$$ LANGUAGE plpgsql;
+
+-- 시스템 설정값 조회 함수
+-- 타입 변환을 자동으로 처리하여 코드에서 쉽게 사용
+CREATE OR REPLACE FUNCTION get_system_setting(setting_key_param VARCHAR)
+RETURNS TEXT AS $$
+DECLARE
+    result_value TEXT;
+BEGIN
+    SELECT setting_value INTO result_value
+    FROM public.system_settings 
+    WHERE setting_key = setting_key_param AND is_active = TRUE;
+    
+    RETURN COALESCE(result_value, '');
+END;
+$$ LANGUAGE plpgsql;
+
+-- 숫자 타입 시스템 설정값 조회 함수
+CREATE OR REPLACE FUNCTION get_system_setting_number(setting_key_param VARCHAR)
+RETURNS DECIMAL AS $$
+DECLARE
+    result_value TEXT;
+BEGIN
+    SELECT setting_value INTO result_value
+    FROM public.system_settings 
+    WHERE setting_key = setting_key_param AND value_type = 'number' AND is_active = TRUE;
+    
+    RETURN COALESCE(result_value::DECIMAL, 0);
+END;
+$$ LANGUAGE plpgsql;
+
+-- 간소화: 복잡한 정책 조회 제거 (system_settings으로 충분)
+
+-- =============================================
+-- 공용 설정 테이블 트리거들 (TRIGGERS FOR SETTINGS TABLES)
+-- =============================================
+
+-- 설정 테이블들에 updated_at 트리거 추가
+CREATE TRIGGER update_system_settings_updated_at BEFORE UPDATE ON public.system_settings
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+-- 간소화: business_policies 관련 트리거 제거됨
+
+CREATE TRIGGER update_service_category_configs_updated_at BEFORE UPDATE ON public.service_category_configs
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+-- 간소화: notification_templates 관련 트리거 제거됨
+
+CREATE TRIGGER update_app_configs_updated_at BEFORE UPDATE ON public.app_configs
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+-- =============================================
 -- 앱 공지사항 테이블
 -- 마이페이지의 공지사항 기능과 홈 화면 이벤트 배너 지원
 -- target_user_type으로 사용자 그룹별 노출 제어
@@ -752,6 +1201,26 @@ INSERT INTO public.users (
     NOW()
 ) ON CONFLICT (id) DO NOTHING;
 
+-- 시스템 핵심 설정 초기값들 (간소화된 MVP 버전)
+INSERT INTO public.system_settings (setting_key, setting_value, value_type, category, description) VALUES
+-- 수수료 관련 설정 (기존 business_policies의 핵심 정책만)
+('partnered_commission_rate', '8.00', 'number', 'commission', '입점샵 수수료율 (%)'),
+('non_partnered_commission_rate', '10.00', 'number', 'commission', '일반샵 수수료율 (%)'),
+
+-- 포인트 관련 설정
+('point_earning_rate', '2.5', 'number', 'point', '포인트 적립률 (%)'),
+('point_max_eligible_amount', '300000', 'number', 'point', '포인트 적립 가능 최대 금액 (원)'),
+('point_restriction_days', '7', 'number', 'point', '포인트 사용 제한 기간 (일)'),
+('influencer_point_bonus_rate', '1.5', 'number', 'point', '인플루언서 포인트 보너스 배율'),
+
+-- 예약 관련 설정
+('default_cancellation_hours', '24', 'number', 'reservation', '기본 취소 가능 시간 (시간)'),
+('min_deposit_amount', '10000', 'number', 'reservation', '최소 예약금 금액 (원)'),
+
+-- 앱 운영 설정
+('app_maintenance_mode', 'false', 'boolean', 'app', '앱 점검 모드'),
+('customer_service_phone', '1588-0000', 'string', 'app', '고객센터 전화번호');
+
 -- 자주 묻는 질문 초기 데이터
 -- 마이페이지 FAQ 기능을 위한 기본 질문들
 INSERT INTO public.faqs (category, question, answer, display_order) VALUES
@@ -764,6 +1233,18 @@ INSERT INTO public.faqs (category, question, answer, display_order) VALUES
 -- 앱 공지사항 초기 데이터
 INSERT INTO public.announcements (title, content, is_important, target_user_type) VALUES
 ('에뷰리띵 앱 출시!', '에뷰리띵 앱이 정식 출시되었습니다. 다양한 혜택을 확인해보세요!', true, ARRAY['user'::user_role]);
+
+-- 정산 스케줄 초기 데이터
+INSERT INTO public.settlement_schedules (
+    schedule_name, settlement_period, schedule_day, schedule_time, 
+    auto_approve, notification_emails, created_by
+) VALUES 
+('주간 정산 (목요일)', 'weekly'::settlement_period, 4, '15:00', 
+ false, ARRAY['finance@ebeautything.com', 'admin@ebeautything.com'], 
+ '00000000-0000-0000-0000-000000000001'::UUID),
+('월간 정산 (매월 5일)', 'monthly'::settlement_period, 5, '14:00',
+ false, ARRAY['finance@ebeautything.com'], 
+ '00000000-0000-0000-0000-000000000001'::UUID);
 
 -- =============================================
 -- 주요 조회용 뷰들 (VIEWS FOR COMMON QUERIES)
@@ -889,3 +1370,1109 @@ ORDER BY r.reservation_date DESC, r.reservation_time DESC;
 -- 간소화된 데이터베이스 구조 완료
 -- END OF SIMPLIFIED DATABASE STRUCTURE
 -- ============================================= 
+
+-- =============================================
+-- 관리자용 설정 관리 뷰들 (ADMIN VIEWS FOR SETTINGS MANAGEMENT)
+-- =============================================
+
+-- 관리자용 시스템 설정 요약 뷰
+CREATE VIEW admin_settings_summary AS
+SELECT 
+    category,
+    COUNT(*) as setting_count,
+    COUNT(CASE WHEN is_active THEN 1 END) as active_count,
+    MAX(updated_at) as last_updated
+FROM public.system_settings
+GROUP BY category
+ORDER BY category;
+
+-- 간소화: business_policies 제거로 관련 뷰도 제거됨 
+
+-- =============================================
+-- 샵 관리자 시스템 (SHOP OWNER MANAGEMENT SYSTEM)
+-- =============================================
+
+-- 샵 대시보드 통계 뷰 (샵 사장용)
+-- 샵 사장이 본인 샵의 성과를 볼 수 있는 실시간 통계
+CREATE VIEW shop_owner_dashboard AS
+SELECT 
+    s.id as shop_id,
+    s.name as shop_name,
+    s.owner_id,
+    -- 이번 달 통계
+    COALESCE(current_month.total_bookings, 0) as this_month_bookings,
+    COALESCE(current_month.completed_bookings, 0) as this_month_completed,
+    COALESCE(current_month.total_revenue, 0) as this_month_revenue,
+    COALESCE(current_month.commission_amount, 0) as this_month_commission,
+    -- 지난달 통계 (비교용)
+    COALESCE(last_month.total_bookings, 0) as last_month_bookings,
+    COALESCE(last_month.total_revenue, 0) as last_month_revenue,
+    -- 전체 통계
+    COALESCE(all_time.total_bookings, 0) as total_bookings,
+    COALESCE(all_time.total_revenue, 0) as total_revenue,
+    -- 대기 중인 예약
+    COALESCE(pending.pending_count, 0) as pending_reservations,
+    -- 최근 정산 정보
+    latest_settlement.settlement_amount as last_settlement_amount,
+    latest_settlement.settled_at as last_settlement_date
+FROM public.shops s
+-- 이번 달 통계
+LEFT JOIN (
+    SELECT 
+        shop_id,
+        COUNT(*) as total_bookings,
+        COUNT(CASE WHEN status = 'completed' THEN 1 END) as completed_bookings,
+        SUM(CASE WHEN status = 'completed' THEN total_amount ELSE 0 END) as total_revenue,
+        SUM(CASE WHEN status = 'completed' THEN total_amount * calculate_commission_rate(shop_id) / 100 ELSE 0 END) as commission_amount
+    FROM public.reservations
+    WHERE DATE_TRUNC('month', reservation_date) = DATE_TRUNC('month', CURRENT_DATE)
+    GROUP BY shop_id
+) current_month ON s.id = current_month.shop_id
+-- 지난달 통계
+LEFT JOIN (
+    SELECT 
+        shop_id,
+        COUNT(*) as total_bookings,
+        SUM(CASE WHEN status = 'completed' THEN total_amount ELSE 0 END) as total_revenue
+    FROM public.reservations
+    WHERE DATE_TRUNC('month', reservation_date) = DATE_TRUNC('month', CURRENT_DATE - INTERVAL '1 month')
+    GROUP BY shop_id
+) last_month ON s.id = last_month.shop_id
+-- 전체 통계
+LEFT JOIN (
+    SELECT 
+        shop_id,
+        COUNT(*) as total_bookings,
+        SUM(CASE WHEN status = 'completed' THEN total_amount ELSE 0 END) as total_revenue
+    FROM public.reservations
+    GROUP BY shop_id
+) all_time ON s.id = all_time.shop_id
+-- 대기 중인 예약
+LEFT JOIN (
+    SELECT 
+        shop_id,
+        COUNT(*) as pending_count
+    FROM public.reservations
+    WHERE status = 'requested'
+    GROUP BY shop_id
+) pending ON s.id = pending.shop_id
+-- 최근 정산 정보
+LEFT JOIN (
+    SELECT DISTINCT ON (shop_id)
+        shop_id,
+        net_settlement_amount as settlement_amount,
+        settled_at
+    FROM public.shop_settlements
+    WHERE settlement_status = 'completed'
+    ORDER BY shop_id, settled_at DESC
+) latest_settlement ON s.id = latest_settlement.shop_id;
+
+-- =============================================
+-- 샵 관리자 권한 시스템 (RLS POLICIES FOR SHOP OWNERS)
+-- =============================================
+
+-- 정산 관련 테이블들에 RLS 활성화
+ALTER TABLE public.shop_settlement_configs ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.shop_settlements ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.settlement_transfers ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.settlement_schedules ENABLE ROW LEVEL SECURITY;
+
+-- 샵 사장은 본인 샵의 정산 설정만 조회/수정 가능
+CREATE POLICY "Shop owners can manage own settlement configs" ON public.shop_settlement_configs
+    FOR ALL USING (
+        EXISTS (
+            SELECT 1 FROM public.shops 
+            WHERE shops.id = shop_settlement_configs.shop_id 
+            AND shops.owner_id = auth.uid()
+        )
+    );
+
+-- 샵 사장은 본인 샵의 정산 내역만 조회 가능 (수정 불가)
+CREATE POLICY "Shop owners can read own settlement history" ON public.shop_settlements
+    FOR SELECT USING (
+        EXISTS (
+            SELECT 1 FROM public.shops 
+            WHERE shops.id = shop_settlements.shop_id 
+            AND shops.owner_id = auth.uid()
+        )
+    );
+
+-- 샵 사장은 본인 샵의 송금 상태만 조회 가능
+CREATE POLICY "Shop owners can read own transfer status" ON public.settlement_transfers
+    FOR SELECT USING (
+        EXISTS (
+            SELECT 1 FROM public.shop_settlements ss
+            JOIN public.shops s ON ss.shop_id = s.id
+            WHERE ss.id = settlement_transfers.settlement_id
+            AND s.owner_id = auth.uid()
+        )
+    );
+
+-- 관리자만 정산 스케줄 관리 가능
+CREATE POLICY "Only admins can manage settlement schedules" ON public.settlement_schedules
+    FOR ALL USING (
+        EXISTS (
+            SELECT 1 FROM public.users 
+            WHERE users.id = auth.uid() 
+            AND users.user_role = 'admin'
+        )
+    );
+
+-- 샵 서비스 관리 정책 강화 (샵 사장이 본인 샵 서비스만 관리)
+CREATE POLICY "Shop owners can manage own services" ON public.shop_services
+    FOR ALL USING (
+        EXISTS (
+            SELECT 1 FROM public.shops 
+            WHERE shops.id = shop_services.shop_id 
+            AND shops.owner_id = auth.uid()
+        )
+    );
+
+-- 샵 이미지 관리 정책
+CREATE POLICY "Shop owners can manage own shop images" ON public.shop_images
+    FOR ALL USING (
+        EXISTS (
+            SELECT 1 FROM public.shops 
+            WHERE shops.id = shop_images.shop_id 
+            AND shops.owner_id = auth.uid()
+        )
+    );
+
+-- 서비스 이미지 관리 정책
+CREATE POLICY "Shop owners can manage own service images" ON public.service_images
+    FOR ALL USING (
+        EXISTS (
+            SELECT 1 FROM public.shop_services ss
+            JOIN public.shops s ON ss.shop_id = s.id
+            WHERE ss.id = service_images.service_id
+            AND s.owner_id = auth.uid()
+        )
+    );
+
+-- =============================================
+-- 완전한 정산 프로세스 함수들 (COMPLETE SETTLEMENT PROCESS)
+-- =============================================
+
+-- 정산 승인 함수 (관리자용)
+-- 관리자가 정산을 승인하고 송금 대기 상태로 변경
+CREATE OR REPLACE FUNCTION approve_settlement(
+    settlement_uuid UUID,
+    admin_uuid UUID,
+    approval_notes TEXT DEFAULT NULL
+)
+RETURNS BOOLEAN AS $$
+DECLARE
+    settlement_record RECORD;
+    transfer_id UUID;
+BEGIN
+    -- 정산 정보 조회
+    SELECT * INTO settlement_record 
+    FROM public.shop_settlements 
+    WHERE id = settlement_uuid AND settlement_status = 'pending';
+    
+    IF NOT FOUND THEN
+        RAISE EXCEPTION '승인 가능한 정산 건을 찾을 수 없습니다.';
+    END IF;
+    
+    -- 정산 상태를 승인됨으로 변경
+    UPDATE public.shop_settlements 
+    SET settlement_status = 'completed'::settlement_status,
+        updated_at = NOW()
+    WHERE id = settlement_uuid;
+    
+    -- 송금 처리 레코드 생성
+    INSERT INTO public.settlement_transfers (
+        settlement_id,
+        transfer_status,
+        approved_by,
+        approved_at,
+        transfer_amount,
+        admin_notes
+    ) VALUES (
+        settlement_uuid,
+        'approved',
+        admin_uuid,
+        NOW(),
+        settlement_record.net_settlement_amount,
+        approval_notes
+    ) RETURNING id INTO transfer_id;
+    
+    -- 간소화된 로그 기록
+    INSERT INTO public.settlement_logs (
+        settlement_id,
+        action,
+        performed_by,
+        notes
+    ) VALUES (
+        settlement_uuid,
+        'approved',
+        admin_uuid,
+        approval_notes
+    );
+    
+    RETURN TRUE;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+-- 송금 요청 함수
+-- 실제 은행 송금이나 토스 송금을 요청하는 함수
+CREATE OR REPLACE FUNCTION request_transfer(
+    settlement_uuid UUID,
+    admin_uuid UUID,
+    transfer_method_param VARCHAR(50) DEFAULT 'bank_transfer'
+)
+RETURNS BOOLEAN AS $$
+DECLARE
+    transfer_record RECORD;
+BEGIN
+    -- 송금 정보 및 샵 설정 조회
+    SELECT 
+        st.*,
+        ssc.bank_name,
+        ssc.bank_account,
+        ssc.account_holder
+    INTO transfer_record
+    FROM public.settlement_transfers st
+    JOIN public.shop_settlements ss ON st.settlement_id = ss.id
+    JOIN public.shop_settlement_configs ssc ON ss.shop_id = ssc.shop_id
+    WHERE st.settlement_id = settlement_uuid 
+    AND st.transfer_status = 'approved';
+    
+    IF NOT FOUND THEN
+        RAISE EXCEPTION '송금 요청 가능한 정산 건을 찾을 수 없습니다.';
+    END IF;
+    
+    -- 송금 상태 업데이트
+    UPDATE public.settlement_transfers
+    SET transfer_status = 'transfer_requested',
+        transfer_method = transfer_method_param,
+        bank_name = transfer_record.bank_name,
+        account_number = transfer_record.bank_account,
+        account_holder = transfer_record.account_holder,
+        transfer_requested_at = NOW(),
+        updated_at = NOW()
+    WHERE settlement_id = settlement_uuid;
+    
+    -- 간소화된 로그 기록
+    INSERT INTO public.settlement_logs (
+        settlement_id,
+        action,
+        performed_by,
+        notes
+    ) VALUES (
+        settlement_uuid,
+        'transfer_requested',
+        admin_uuid,
+        '송금 요청: ' || transfer_method_param || ' - ' || transfer_record.account_holder
+    );
+    
+    -- 여기서 실제 외부 송금 API 호출
+    -- 예: 토스페이먼츠, 은행 API 등
+    
+    RETURN TRUE;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+-- 송금 완료 처리 함수
+-- 외부 송금 서비스에서 송금 완료 콜백을 받았을 때 호출
+CREATE OR REPLACE FUNCTION complete_transfer(
+    settlement_uuid UUID,
+    external_transfer_id_param VARCHAR(255),
+    actual_transfer_amount INTEGER DEFAULT NULL,
+    transfer_fee_param INTEGER DEFAULT 0
+)
+RETURNS BOOLEAN AS $$
+BEGIN
+    -- 송금 완료 상태로 업데이트
+    UPDATE public.settlement_transfers
+    SET transfer_status = 'transfer_completed',
+        external_transfer_id = external_transfer_id_param,
+        transfer_completed_at = NOW(),
+        transfer_fee = transfer_fee_param,
+        updated_at = NOW()
+    WHERE settlement_id = settlement_uuid;
+    
+    -- 정산 상태를 완료로 변경
+    UPDATE public.shop_settlements
+    SET settlement_status = 'completed'::settlement_status,
+        settled_at = NOW(),
+        updated_at = NOW()
+    WHERE id = settlement_uuid;
+    
+    -- 간소화된 로그 기록
+    INSERT INTO public.settlement_logs (
+        settlement_id,
+        action,
+        performed_by,
+        notes
+    ) VALUES (
+        settlement_uuid,
+        'completed',
+        NULL, -- 시스템 자동 처리
+        '송금 완료: ' || external_transfer_id_param || ' (수수료: ' || transfer_fee_param || '원)'
+    );
+    
+    RETURN TRUE;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+-- 정산 프로세스 상태 조회 함수
+-- 샵 사장이 본인 정산 상태를 조회할 수 있는 함수
+CREATE OR REPLACE FUNCTION get_settlement_status(shop_uuid UUID)
+RETURNS TABLE(
+    settlement_id UUID,
+    period_start DATE,
+    period_end DATE,
+    gross_revenue INTEGER,
+    commission_amount INTEGER,
+    net_settlement INTEGER,
+    settlement_status settlement_status,
+    transfer_status VARCHAR(50),
+    expected_transfer_date DATE,
+    completed_at TIMESTAMPTZ
+) AS $$
+BEGIN
+    RETURN QUERY
+    SELECT 
+        ss.id as settlement_id,
+        ss.period_start_date,
+        ss.period_end_date,
+        ss.gross_revenue,
+        ss.commission_amount,
+        ss.net_settlement_amount,
+        ss.settlement_status,
+        COALESCE(st.transfer_status, 'not_started'::VARCHAR(50)) as transfer_status,
+        -- 예상 송금일 계산 (승인 후 3영업일)
+        CASE 
+            WHEN st.approved_at IS NOT NULL 
+            THEN (st.approved_at::DATE + INTERVAL '3 days')::DATE
+            ELSE NULL
+        END as expected_transfer_date,
+        ss.settled_at as completed_at
+    FROM public.shop_settlements ss
+    LEFT JOIN public.settlement_transfers st ON ss.id = st.settlement_id
+    WHERE ss.shop_id = shop_uuid
+    ORDER BY ss.period_start_date DESC;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+-- 정산 스케줄 실행 함수
+-- 크론 작업에서 호출하여 정기적으로 정산 배치 생성
+CREATE OR REPLACE FUNCTION execute_scheduled_settlements()
+RETURNS INTEGER AS $$
+DECLARE
+    schedule_record RECORD;
+    batch_count INTEGER := 0;
+    start_date DATE;
+    end_date DATE;
+BEGIN
+    -- 활성화된 정산 스케줄들을 순회
+    FOR schedule_record IN 
+        SELECT * FROM public.settlement_schedules 
+        WHERE is_active = TRUE
+    LOOP
+        -- 정산 기간 계산
+        CASE schedule_record.settlement_period
+            WHEN 'weekly' THEN
+                start_date := DATE_TRUNC('week', CURRENT_DATE - INTERVAL '1 week')::DATE;
+                end_date := (start_date + INTERVAL '6 days')::DATE;
+            WHEN 'bi_weekly' THEN
+                start_date := DATE_TRUNC('week', CURRENT_DATE - INTERVAL '2 weeks')::DATE;
+                end_date := (start_date + INTERVAL '13 days')::DATE;
+            WHEN 'monthly' THEN
+                start_date := DATE_TRUNC('month', CURRENT_DATE - INTERVAL '1 month')::DATE;
+                end_date := (DATE_TRUNC('month', CURRENT_DATE) - INTERVAL '1 day')::DATE;
+        END CASE;
+        
+        -- 정산 배치 생성
+        PERFORM create_settlement_batch(
+            schedule_record.settlement_period,
+            start_date,
+            end_date
+        );
+        
+        batch_count := batch_count + 1;
+    END LOOP;
+    
+    RETURN batch_count;
+END;
+$$ LANGUAGE plpgsql;
+
+-- =============================================
+-- 샵 사장 온보딩 및 관리 시스템 (SHOP OWNER ONBOARDING & MANAGEMENT)
+-- =============================================
+
+-- 샵 등록 신청 테이블
+-- 샵 사장이 직접 신청하고 관리자가 승인하는 프로세스
+CREATE TABLE public.shop_applications (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    applicant_id UUID NOT NULL REFERENCES public.users(id) ON DELETE CASCADE, -- 신청자
+    shop_name VARCHAR(255) NOT NULL, -- 신청할 샵명
+    business_license_number VARCHAR(50) NOT NULL, -- 사업자등록번호
+    business_license_image_url TEXT, -- 사업자등록증 이미지
+    shop_address TEXT NOT NULL, -- 샵 주소
+    detailed_address TEXT, -- 상세 주소
+    phone_number VARCHAR(20) NOT NULL, -- 샵 전화번호
+    main_category service_category NOT NULL, -- 주 서비스 카테고리
+    sub_categories service_category[], -- 부가 서비스들
+    description TEXT, -- 샵 소개
+    application_status VARCHAR(50) DEFAULT 'pending', -- 신청 상태 ('pending', 'approved', 'rejected')
+    rejection_reason TEXT, -- 거절 사유
+    reviewed_by UUID REFERENCES public.users(id), -- 심사한 관리자
+    reviewed_at TIMESTAMPTZ, -- 심사 완료 시간
+    approved_shop_id UUID REFERENCES public.shops(id), -- 승인된 샵 ID
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- 샵 운영 시간 관리 테이블 (더 구체적인 운영시간 관리)
+CREATE TABLE public.shop_operating_hours (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    shop_id UUID NOT NULL REFERENCES public.shops(id) ON DELETE CASCADE,
+    day_of_week INTEGER NOT NULL, -- 0=일요일, 1=월요일, ..., 6=토요일
+    is_open BOOLEAN DEFAULT TRUE, -- 해당 요일 영업 여부
+    open_time TIME, -- 영업 시작 시간
+    close_time TIME, -- 영업 종료 시간
+    break_start_time TIME, -- 휴게 시작 시간 (선택)
+    break_end_time TIME, -- 휴게 종료 시간 (선택)
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(shop_id, day_of_week)
+);
+
+-- 예약 승인/거부 로그 테이블
+CREATE TABLE public.reservation_actions (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    reservation_id UUID NOT NULL REFERENCES public.reservations(id) ON DELETE CASCADE,
+    action VARCHAR(50) NOT NULL, -- 'confirmed', 'cancelled_by_shop', 'modified'
+    performed_by UUID REFERENCES public.users(id), -- 작업한 샵 사장
+    reason TEXT, -- 승인/거부 사유
+    previous_status reservation_status, -- 이전 상태
+    new_status reservation_status, -- 새로운 상태
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- 샵 사장 알림 설정 테이블
+CREATE TABLE public.shop_notification_settings (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    shop_id UUID NOT NULL REFERENCES public.shops(id) ON DELETE CASCADE,
+    new_reservation_notification BOOLEAN DEFAULT TRUE, -- 신규 예약 알림
+    cancellation_notification BOOLEAN DEFAULT TRUE, -- 취소 알림
+    review_notification BOOLEAN DEFAULT TRUE, -- 리뷰 알림 (향후)
+    settlement_notification BOOLEAN DEFAULT TRUE, -- 정산 알림
+    email_notifications BOOLEAN DEFAULT TRUE, -- 이메일 알림
+    sms_notifications BOOLEAN DEFAULT FALSE, -- SMS 알림 (향후)
+    notification_hours_start TIME DEFAULT '09:00', -- 알림 받을 시작 시간
+    notification_hours_end TIME DEFAULT '22:00', -- 알림 받을 종료 시간
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(shop_id)
+);
+
+-- =============================================
+-- 샵 사장 관리 기능 함수들 (SHOP OWNER MANAGEMENT FUNCTIONS)
+-- =============================================
+
+-- 샵 등록 신청 함수
+CREATE OR REPLACE FUNCTION apply_for_shop(
+    applicant_uuid UUID,
+    shop_name_param VARCHAR(255),
+    business_license_param VARCHAR(50),
+    address_param TEXT,
+    phone_param VARCHAR(20),
+    main_category_param service_category,
+    description_param TEXT DEFAULT NULL
+)
+RETURNS UUID AS $$
+DECLARE
+    application_id UUID;
+BEGIN
+    -- 이미 승인된 샵이 있는지 확인
+    IF EXISTS (
+        SELECT 1 FROM public.shops 
+        WHERE owner_id = applicant_uuid 
+        AND shop_status IN ('active', 'pending_approval')
+    ) THEN
+        RAISE EXCEPTION '이미 등록된 샵이 있습니다.';
+    END IF;
+    
+    -- 신청서 생성
+    INSERT INTO public.shop_applications (
+        applicant_id,
+        shop_name,
+        business_license_number,
+        shop_address,
+        phone_number,
+        main_category,
+        description,
+        application_status
+    ) VALUES (
+        applicant_uuid,
+        shop_name_param,
+        business_license_param,
+        address_param,
+        phone_param,
+        main_category_param,
+        description_param,
+        'pending'
+    ) RETURNING id INTO application_id;
+    
+    RETURN application_id;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+-- 샵 등록 승인 함수 (관리자용)
+CREATE OR REPLACE FUNCTION approve_shop_application(
+    application_uuid UUID,
+    admin_uuid UUID
+)
+RETURNS UUID AS $$
+DECLARE
+    application_record RECORD;
+    new_shop_id UUID;
+    i INTEGER;
+BEGIN
+    -- 신청서 정보 조회
+    SELECT * INTO application_record 
+    FROM public.shop_applications 
+    WHERE id = application_uuid AND application_status = 'pending';
+    
+    IF NOT FOUND THEN
+        RAISE EXCEPTION '승인 가능한 신청서를 찾을 수 없습니다.';
+    END IF;
+    
+    -- 샵 생성
+    INSERT INTO public.shops (
+        owner_id,
+        name,
+        address,
+        phone_number,
+        main_category,
+        sub_categories,
+        description,
+        business_license_number,
+        shop_status,
+        verification_status
+    ) VALUES (
+        application_record.applicant_id,
+        application_record.shop_name,
+        application_record.shop_address,
+        application_record.phone_number,
+        application_record.main_category,
+        application_record.sub_categories,
+        application_record.description,
+        application_record.business_license_number,
+        'active',
+        'verified'
+    ) RETURNING id INTO new_shop_id;
+    
+    -- 사용자 역할을 shop_owner로 변경
+    UPDATE public.users 
+    SET user_role = 'shop_owner'::user_role,
+        updated_at = NOW()
+    WHERE id = application_record.applicant_id;
+    
+    -- 기본 운영시간 설정 (월-일, 09:00-18:00)
+    FOR i IN 0..6 LOOP
+        INSERT INTO public.shop_operating_hours (
+            shop_id, day_of_week, is_open, open_time, close_time
+        ) VALUES (
+            new_shop_id, i, TRUE, '09:00'::TIME, '18:00'::TIME
+        );
+    END LOOP;
+    
+    -- 기본 알림 설정 생성
+    INSERT INTO public.shop_notification_settings (shop_id)
+    VALUES (new_shop_id);
+    
+    -- 신청서 상태 업데이트
+    UPDATE public.shop_applications 
+    SET application_status = 'approved',
+        reviewed_by = admin_uuid,
+        reviewed_at = NOW(),
+        approved_shop_id = new_shop_id,
+        updated_at = NOW()
+    WHERE id = application_uuid;
+    
+    RETURN new_shop_id;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+-- 예약 승인 함수 (샵 사장용)
+CREATE OR REPLACE FUNCTION confirm_reservation(
+    reservation_uuid UUID,
+    shop_owner_uuid UUID,
+    confirmation_notes TEXT DEFAULT NULL
+)
+RETURNS BOOLEAN AS $$
+DECLARE
+    reservation_record RECORD;
+BEGIN
+    -- 예약 정보 및 권한 확인
+    SELECT r.*, s.owner_id 
+    INTO reservation_record
+    FROM public.reservations r
+    JOIN public.shops s ON r.shop_id = s.id
+    WHERE r.id = reservation_uuid 
+    AND r.status = 'requested'
+    AND s.owner_id = shop_owner_uuid;
+    
+    IF NOT FOUND THEN
+        RAISE EXCEPTION '승인 가능한 예약을 찾을 수 없습니다.';
+    END IF;
+    
+    -- 예약 상태를 confirmed로 변경
+    UPDATE public.reservations 
+    SET status = 'confirmed'::reservation_status,
+        confirmed_at = NOW(),
+        updated_at = NOW()
+    WHERE id = reservation_uuid;
+    
+    -- 승인 로그 기록
+    INSERT INTO public.reservation_actions (
+        reservation_id,
+        action,
+        performed_by,
+        reason,
+        previous_status,
+        new_status
+    ) VALUES (
+        reservation_uuid,
+        'confirmed',
+        shop_owner_uuid,
+        confirmation_notes,
+        'requested'::reservation_status,
+        'confirmed'::reservation_status
+    );
+    
+    -- 사용자에게 알림 발송 (여기서는 알림 테이블에 추가)
+    INSERT INTO public.notifications (
+        user_id,
+        notification_type,
+        title,
+        message,
+        related_id
+    ) VALUES (
+        reservation_record.user_id,
+        'reservation_confirmed',
+        '예약이 확정되었습니다',
+        '예약이 샵에서 승인되었습니다. 예약 시간에 방문해 주세요.',
+        reservation_uuid
+    );
+    
+    RETURN TRUE;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+-- 예약 거절 함수 (샵 사장용)
+CREATE OR REPLACE FUNCTION cancel_reservation_by_shop(
+    reservation_uuid UUID,
+    shop_owner_uuid UUID,
+    cancellation_reason TEXT
+)
+RETURNS BOOLEAN AS $$
+DECLARE
+    reservation_record RECORD;
+BEGIN
+    -- 예약 정보 및 권한 확인
+    SELECT r.*, s.owner_id 
+    INTO reservation_record
+    FROM public.reservations r
+    JOIN public.shops s ON r.shop_id = s.id
+    WHERE r.id = reservation_uuid 
+    AND r.status IN ('requested', 'confirmed')
+    AND s.owner_id = shop_owner_uuid;
+    
+    IF NOT FOUND THEN
+        RAISE EXCEPTION '취소 가능한 예약을 찾을 수 없습니다.';
+    END IF;
+    
+    -- 예약 상태를 cancelled_by_shop으로 변경
+    UPDATE public.reservations 
+    SET status = 'cancelled_by_shop'::reservation_status,
+        cancellation_reason = cancellation_reason,
+        cancelled_at = NOW(),
+        updated_at = NOW()
+    WHERE id = reservation_uuid;
+    
+    -- 취소 로그 기록
+    INSERT INTO public.reservation_actions (
+        reservation_id,
+        action,
+        performed_by,
+        reason,
+        previous_status,
+        new_status
+    ) VALUES (
+        reservation_uuid,
+        'cancelled_by_shop',
+        shop_owner_uuid,
+        cancellation_reason,
+        reservation_record.status,
+        'cancelled_by_shop'::reservation_status
+    );
+    
+    -- 사용자에게 알림 발송
+    INSERT INTO public.notifications (
+        user_id,
+        notification_type,
+        title,
+        message,
+        related_id
+    ) VALUES (
+        reservation_record.user_id,
+        'reservation_cancelled',
+        '예약이 취소되었습니다',
+        '샵 사정으로 예약이 취소되었습니다. 예약금은 환불됩니다.',
+        reservation_uuid
+    );
+    
+    RETURN TRUE;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+-- 샵 운영시간 업데이트 함수
+CREATE OR REPLACE FUNCTION update_shop_hours(
+    shop_uuid UUID,
+    day_of_week_param INTEGER,
+    is_open_param BOOLEAN,
+    open_time_param TIME DEFAULT NULL,
+    close_time_param TIME DEFAULT NULL,
+    break_start_param TIME DEFAULT NULL,
+    break_end_param TIME DEFAULT NULL
+)
+RETURNS BOOLEAN AS $$
+BEGIN
+    -- 운영시간 업데이트 (UPSERT)
+    INSERT INTO public.shop_operating_hours (
+        shop_id, day_of_week, is_open, open_time, close_time, 
+        break_start_time, break_end_time
+    ) VALUES (
+        shop_uuid, day_of_week_param, is_open_param, 
+        open_time_param, close_time_param, break_start_param, break_end_param
+    )
+    ON CONFLICT (shop_id, day_of_week) 
+    DO UPDATE SET
+        is_open = EXCLUDED.is_open,
+        open_time = EXCLUDED.open_time,
+        close_time = EXCLUDED.close_time,
+        break_start_time = EXCLUDED.break_start_time,
+        break_end_time = EXCLUDED.break_end_time,
+        updated_at = NOW();
+    
+    RETURN TRUE;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+-- =============================================
+-- 샵 사장 권한 정책 추가 (ADDITIONAL RLS POLICIES)
+-- =============================================
+
+-- 샵 등록 신청서 관련 정책
+ALTER TABLE public.shop_applications ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY "Users can create own shop applications" ON public.shop_applications
+    FOR INSERT WITH CHECK (auth.uid() = applicant_id);
+
+CREATE POLICY "Users can read own shop applications" ON public.shop_applications
+    FOR SELECT USING (auth.uid() = applicant_id);
+
+CREATE POLICY "Admins can read all shop applications" ON public.shop_applications
+    FOR SELECT USING (
+        EXISTS (
+            SELECT 1 FROM public.users 
+            WHERE users.id = auth.uid() 
+            AND users.user_role = 'admin'
+        )
+    );
+
+-- 샵 운영시간 관련 정책
+ALTER TABLE public.shop_operating_hours ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY "Shop owners can manage own operating hours" ON public.shop_operating_hours
+    FOR ALL USING (
+        EXISTS (
+            SELECT 1 FROM public.shops 
+            WHERE shops.id = shop_operating_hours.shop_id 
+            AND shops.owner_id = auth.uid()
+        )
+    );
+
+-- 예약 승인 로그 관련 정책
+ALTER TABLE public.reservation_actions ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY "Shop owners can read own reservation actions" ON public.reservation_actions
+    FOR SELECT USING (
+        EXISTS (
+            SELECT 1 FROM public.reservations r
+            JOIN public.shops s ON r.shop_id = s.id
+            WHERE r.id = reservation_actions.reservation_id
+            AND s.owner_id = auth.uid()
+        )
+    );
+
+-- =============================================
+-- 샵 사장 대시보드 향상된 뷰 (ENHANCED SHOP OWNER VIEWS)
+-- =============================================
+
+-- 샵 사장용 오늘 예약 현황 뷰
+CREATE VIEW shop_today_reservations AS
+SELECT 
+    r.id,
+    r.reservation_time,
+    r.status,
+    r.total_amount,
+    r.special_requests,
+    u.name as customer_name,
+    u.phone_number as customer_phone,
+    s.id as shop_id,
+    s.owner_id,
+    -- 서비스 정보
+    ARRAY_AGG(ss.name) as service_names
+FROM public.reservations r
+JOIN public.users u ON r.user_id = u.id
+JOIN public.shops s ON r.shop_id = s.id
+JOIN public.reservation_services rs ON r.id = rs.reservation_id
+JOIN public.shop_services ss ON rs.service_id = ss.id
+WHERE r.reservation_date = CURRENT_DATE
+GROUP BY r.id, r.reservation_time, r.status, r.total_amount, 
+         r.special_requests, u.name, u.phone_number, s.id, s.owner_id
+ORDER BY r.reservation_time;
+
+-- 샵 사장용 운영시간 뷰
+CREATE VIEW shop_weekly_hours AS
+SELECT 
+    soh.shop_id,
+    soh.day_of_week,
+    CASE soh.day_of_week
+        WHEN 0 THEN '일요일'
+        WHEN 1 THEN '월요일' 
+        WHEN 2 THEN '화요일'
+        WHEN 3 THEN '수요일'
+        WHEN 4 THEN '목요일'
+        WHEN 5 THEN '금요일'
+        WHEN 6 THEN '토요일'
+    END as day_name,
+    soh.is_open,
+    soh.open_time,
+    soh.close_time,
+    soh.break_start_time,
+    soh.break_end_time
+FROM public.shop_operating_hours soh
+ORDER BY soh.shop_id, soh.day_of_week;
+
+-- =============================================
+-- 샵 사장 트리거 추가 (SHOP OWNER TRIGGERS)
+-- =============================================
+
+CREATE TRIGGER update_shop_applications_updated_at 
+    BEFORE UPDATE ON public.shop_applications
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+CREATE TRIGGER update_shop_operating_hours_updated_at 
+    BEFORE UPDATE ON public.shop_operating_hours
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+CREATE TRIGGER update_shop_notification_settings_updated_at 
+    BEFORE UPDATE ON public.shop_notification_settings
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+-- =============================================
+-- 누락된 관리자 권한 정책들 추가 (MISSING ADMIN POLICIES)
+-- =============================================
+
+-- 플랫폼 관리자는 모든 사용자 데이터 조회/수정 가능
+CREATE POLICY "Admins can read all users" ON public.users
+    FOR SELECT USING (
+        EXISTS (
+            SELECT 1 FROM public.users 
+            WHERE users.id = auth.uid() 
+            AND users.user_role = 'admin'
+        )
+    );
+
+CREATE POLICY "Admins can update all users" ON public.users
+    FOR UPDATE USING (
+        EXISTS (
+            SELECT 1 FROM public.users 
+            WHERE users.id = auth.uid() 
+            AND users.user_role = 'admin'
+        )
+    );
+
+-- 플랫폼 관리자는 모든 샵 데이터 조회/수정 가능
+CREATE POLICY "Admins can read all shops" ON public.shops
+    FOR SELECT USING (
+        EXISTS (
+            SELECT 1 FROM public.users 
+            WHERE users.id = auth.uid() 
+            AND users.user_role = 'admin'
+        )
+    );
+
+CREATE POLICY "Admins can update all shops" ON public.shops
+    FOR UPDATE USING (
+        EXISTS (
+            SELECT 1 FROM public.users 
+            WHERE users.id = auth.uid() 
+            AND users.user_role = 'admin'
+        )
+    );
+
+-- 플랫폼 관리자는 모든 예약 데이터 조회/수정 가능
+CREATE POLICY "Admins can read all reservations" ON public.reservations
+    FOR SELECT USING (
+        EXISTS (
+            SELECT 1 FROM public.users 
+            WHERE users.id = auth.uid() 
+            AND users.user_role = 'admin'
+        )
+    );
+
+CREATE POLICY "Admins can update all reservations" ON public.reservations
+    FOR UPDATE USING (
+        EXISTS (
+            SELECT 1 FROM public.users 
+            WHERE users.id = auth.uid() 
+            AND users.user_role = 'admin'
+        )
+    );
+
+-- 샥 관리자는 본인 샵 예약 승인/거부 가능
+CREATE POLICY "Shop owners can update shop reservations" ON public.reservations
+    FOR UPDATE USING (
+        EXISTS (
+            SELECT 1 FROM public.shops 
+            WHERE shops.id = reservations.shop_id 
+            AND shops.owner_id = auth.uid()
+        )
+    );
+
+-- 플랫폼 관리자는 모든 결제 데이터 조회 가능
+ALTER TABLE public.payments ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY "Users can read own payments" ON public.payments
+    FOR SELECT USING (
+        EXISTS (
+            SELECT 1 FROM public.reservations 
+            WHERE reservations.id = payments.reservation_id 
+            AND reservations.user_id = auth.uid()
+        )
+    );
+
+CREATE POLICY "Shop owners can read shop payments" ON public.payments
+    FOR SELECT USING (
+        EXISTS (
+            SELECT 1 FROM public.reservations r
+            JOIN public.shops s ON r.shop_id = s.id
+            WHERE r.id = payments.reservation_id 
+            AND s.owner_id = auth.uid()
+        )
+    );
+
+CREATE POLICY "Admins can read all payments" ON public.payments
+    FOR SELECT USING (
+        EXISTS (
+            SELECT 1 FROM public.users 
+            WHERE users.id = auth.uid() 
+            AND users.user_role = 'admin'
+        )
+    );
+
+-- 플랫폼 관리자는 모든 포인트 거래 조회/수정 가능
+CREATE POLICY "Admins can read all point transactions" ON public.point_transactions
+    FOR SELECT USING (
+        EXISTS (
+            SELECT 1 FROM public.users 
+            WHERE users.id = auth.uid() 
+            AND users.user_role = 'admin'
+        )
+    );
+
+CREATE POLICY "Admins can update point transactions" ON public.point_transactions
+    FOR UPDATE USING (
+        EXISTS (
+            SELECT 1 FROM public.users 
+            WHERE users.id = auth.uid() 
+            AND users.user_role = 'admin'
+        )
+    );
+
+-- 플랫폼 관리자는 시스템 설정 관리 가능
+ALTER TABLE public.system_settings ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.service_category_configs ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.app_configs ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.promotions ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY "Admins can manage system settings" ON public.system_settings
+    FOR ALL USING (
+        EXISTS (
+            SELECT 1 FROM public.users 
+            WHERE users.id = auth.uid() 
+            AND users.user_role = 'admin'
+        )
+    );
+
+CREATE POLICY "Admins can manage service category configs" ON public.service_category_configs
+    FOR ALL USING (
+        EXISTS (
+            SELECT 1 FROM public.users 
+            WHERE users.id = auth.uid() 
+            AND users.user_role = 'admin'
+        )
+    );
+
+CREATE POLICY "Admins can manage app configs" ON public.app_configs
+    FOR ALL USING (
+        EXISTS (
+            SELECT 1 FROM public.users 
+            WHERE users.id = auth.uid() 
+            AND users.user_role = 'admin'
+        )
+    );
+
+CREATE POLICY "Admins can manage promotions" ON public.promotions
+    FOR ALL USING (
+        EXISTS (
+            SELECT 1 FROM public.users 
+            WHERE users.id = auth.uid() 
+            AND users.user_role = 'admin'
+        )
+    );
+
+-- 일반 사용자는 활성 프로모션만 조회 가능
+CREATE POLICY "Users can read active promotions" ON public.promotions
+    FOR SELECT USING (
+        is_active = TRUE 
+        AND start_date <= NOW() 
+        AND (end_date IS NULL OR end_date >= NOW())
+    );
+
+-- 플랫폼 관리자는 모든 정산 데이터 조회/수정 가능
+CREATE POLICY "Admins can manage all settlements" ON public.shop_settlements
+    FOR ALL USING (
+        EXISTS (
+            SELECT 1 FROM public.users 
+            WHERE users.id = auth.uid() 
+            AND users.user_role = 'admin'
+        )
+    );
+
+CREATE POLICY "Admins can manage settlement transfers" ON public.settlement_transfers
+    FOR ALL USING (
+        EXISTS (
+            SELECT 1 FROM public.users 
+            WHERE users.id = auth.uid() 
+            AND users.user_role = 'admin'
+        )
+    );
+
+-- 플랫폼 관리자는 샵 신청서 수정 가능 (승인/거절)
+CREATE POLICY "Admins can update shop applications" ON public.shop_applications
+    FOR UPDATE USING (
+        EXISTS (
+            SELECT 1 FROM public.users 
+            WHERE users.id = auth.uid() 
+            AND users.user_role = 'admin'
+        )
+    );
